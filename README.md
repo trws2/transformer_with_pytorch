@@ -1,12 +1,15 @@
 # Transformer Model Implementation
 
-This repository implements a Transformer model from scratch based on the [Annotated Transformer](https://nlp.seas.harvard.edu/annotated-transformer/). 
+This repository implements a Transformer model from scratch using PyTorch based on [Umar Jamil's PyTorch Transformer](https://github.com/hkproj/pytorch-transformer/). 
 
 The implementation is supposed to be runnable on a MacBook Air. Modification from original implementation is required.
 
 ## Overview
 
 The goal of this project is to provide a clear, line-by-line implementation of the Transformer architecture on a Macbook Air, allowing for a deeper understanding of its components and functionality. 
+
+I also put comments to better illustrate the implementations to help me understand better. These comments are based on verbal descriptions from [Umar Jamil's Youtube video](https://www.youtube.com/watch?v=ISNdQcPhsts),
+and my research online. 
 
 ## Requirements
 
@@ -22,7 +25,7 @@ Before running the code, please ensure you have the following dependencies insta
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/energyminimizer/transformer_with_pytorch.git
+   git clone https://github.com/trws2/transformer_with_pytorch.git
    cd transformer_with_pytorch
    ```
 
