@@ -142,8 +142,8 @@ class MultiHeadAttentionBlock(nn.Module):
         if mask is not None:
             attention_mat.fill_mask(mask == 0, 1e-9)
         attention_mat = attention_mat.softmax(dim=-1)
-        
-        # the original implementation may have a problem that dropout will randomly zeros out 
+
+        # the original implementation may have a problem that dropout will randomly zeros out
         # elements in attention_mat and scales up remaining ones by 1/(1-dropout_rate).
         # so the following dropout code may break property that the last dimension in attention_mat
         # need to be summed to 1.0. it looks to me that it is a bug.
@@ -205,3 +205,198 @@ class MultiHeadAttentionBlock(nn.Module):
         output = output.transpose(1, 2).contiguous().view(x.shape[0], -1, self.d_model)
 
         return self.Wo(output)
+
+
+class EncoderBlock(nn.Module):
+
+    def __init__(
+        self,
+        self_attention_block: MultiHeadAttentionBlock,
+        feed_forward_block: FeedForwardBlock,
+        features: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.feed_forward_block = feed_forward_block
+        self.residual_connections = nn.ModuleList(
+            [ResidualConnection(features, dropout) for _ in range(2)]
+        )
+
+    def forward(self, x, src_mask):
+        # in translational task, produce weighted embedding average from tokens in original language
+        x = self.residual_connections[0](
+            x, lambda x: self.self_attention(x, x, x, src_mask)
+        )
+        x = self.residual_connections[1](x, self.feed_forward_block)
+        return x
+
+
+class Encoder(nn.Module):
+
+    def __init__(self, features: int, layers: nn.ModuleList) -> None:
+        super().__init__()
+        self.layers = layers
+        self.norm = LayerNormalization(features)
+
+    def forward(self, x, mask):
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+
+
+class DecoderBlock(nn.Module):
+
+    def __init__(
+        self,
+        self_attention_block: MultiHeadAttentionBlock,
+        cross_attention_block: MultiHeadAttentionBlock,
+        feed_forward_block: FeedForwardBlock,
+        features: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.cross_attention_block = cross_attention_block
+        self.feed_forward_block = feed_forward_block
+        self.residual_connections = [
+            ResidualConnection(features, dropout) for _ in range(3)
+        ]
+
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
+        # in translational task, produce weighted embedding average from tokens generated from decoder in another language
+        x = self.residual_connections[0](
+            x, lambda x: self.self_attention_block(x, x, x, tgt_mask)
+        )
+        # in translational task, produce weighted embedding average from tokens in original language
+        x = self.residual_connections[1](
+            x,
+            lambda x: self.cross_attention_block(
+                x, encoder_output, encoder_output, src_mask
+            ),
+        )
+        x = self.residual_connections[2](x, self.feed_forward_block)
+        return x
+
+
+class Decoder(nn.Module):
+    def __init__(self, features: int, layers: nn.ModuleList) -> None:
+        super().__init__()
+        self.layers = layers
+        self.norm = LayerNormalization(features)
+
+    def forward(self, x, encoder_output, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, encoder_output, src_mask, tgt_mask)
+        return self.norm(x)
+
+
+class ProjectionLayer(nn.Module):
+    def __init__(self, d_model: int, vocab_size: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        # input x: [batch_size, seq_len, d_model]
+        x = self.proj(x)
+        # x after self.proj: [batch_size, seq_len, vocab_size]
+        #
+        # why there is no softmax along the last dimension?
+        # or it will be encoded in training loss and decoding function, so we do not really need softmax when defining the model arch
+        return x
+
+
+class Transformer(nn.Module):
+
+    def __init__(
+        self,
+        encoder: Encoder,
+        decoder: Decoder,
+        src_embeds: InputEmbeddings,
+        src_pos: PositionalEncoding,
+        tgt_embeds: InputEmbeddings,
+        tgt_pos: PositionalEncoding,
+        projection_layer: ProjectionLayer,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embeds = src_embeds
+        self.src_pos = src_pos
+        self.tgt_embeds = tgt_embeds
+        self.tgt_pos = tgt_pos
+        self.projection_layer = projection_layer
+
+    def encode(self, src, src_mask):
+        x = self.src_embeds(src)
+        x = self.src_pos(x)
+        return self.encoder(x, src_mask)
+
+    def decode(self, tgt, encoder_output, src_mask, tgt_mask):
+        x = self.tgt_embeds(tgt)
+        x = self.tgt_pos(x)
+        return self.decoder(x, encoder_output, src_mask, tgt_mask)
+
+    def project(self, x):
+        return self.projection_layer(x)
+
+
+def build_transformer(
+    src_vocab_size: int,
+    tgt_vocab_size: int,
+    seq_len: int,
+    d_model: int = 512,
+    dropout: float = 0.1,
+    N: int = 6,
+    num_heads: int = 8,
+    d_ff: int = 2048,
+) -> Transformer:
+    # create raw embeddings
+    src_embeds = InputEmbeddings(d_model, src_vocab_size)
+    tgt_embeds = InputEmbeddings(d_model, tgt_vocab_size)
+
+    # add positional embeddings
+    src_pos = PositionalEncoding(d_model, seq_len, dropout)
+    tgt_pos = PositionalEncoding(d_model, seq_len, dropout)
+
+    # initialize encoder blocks
+    encoder_blocks = nn.ModuleList()
+    for _ in range(N):
+        self_attention_block = MultiHeadAttentionBlock(d_model, num_heads, dropout)
+        feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
+        encoder_block = EncoderBlock(
+            self_attention_block, feed_forward_block, d_model, dropout
+        )
+        encoder_blocks.append(encoder_block)
+    encoder = Encoder(d_model, encoder_blocks)
+
+    # initialize decoder blocks
+    decoder_blocks = nn.ModuleList()
+    for _ in range(N):
+        self_attention_block = MultiHeadAttentionBlock(d_model, num_heads, dropout)
+        cross_attention_block = MultiHeadAttentionBlock(d_model, num_heads, dropout)
+        feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
+        decoder_block = DecoderBlock(
+            self_attention_block,
+            cross_attention_block,
+            feed_forward_block,
+            d_model,
+            dropout,
+        )
+        decoder_blocks.append(decoder_block)
+    decoder = Decoder(d_model, decoder_blocks)
+
+    # create project layer
+    projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
+
+    # create transformer
+    transformer = Transformer(
+        encoder, decoder, src_embeds, src_pos, tgt_embeds, tgt_pos, projection_layer
+    )
+
+    # initialize parameter of transformer
+    for p in transformer.parameters():
+        if p.dim > 1:
+            nn.init.xavier_uniform_(p)
+
+    return transformer
