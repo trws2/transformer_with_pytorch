@@ -5,7 +5,7 @@ import math
 
 class InputEmbeddings(nn.Module):
 
-    def __int__(self, d_model: int, vocab_size: int):
+    def __init__(self, d_model: int, vocab_size: int):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
@@ -24,7 +24,7 @@ class PositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # position encoding matrix of size seq_len x d_model (cols x rows)
-        pe = torch.zeros(seq_len, d_model)
+        pe = torch.zeros(seq_len, d_model, device='mps', dtype=torch.float)
 
         # a vector (or matrix) of size 1 x seq_len
         position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
@@ -48,7 +48,7 @@ class PositionalEncoding(nn.Module):
         # unsqueeze because we have a batch of sentences. So the 1st dimension is reserved for different sentences.
         # The 1st dimension size is what we call batch_size
         # pe becomes 1 x seq_len x d_model
-        self.pe = pe.unsqueeze(0)
+        pe = pe.unsqueeze(0)
 
         self.register_buffer("pe", pe)
 
@@ -61,12 +61,12 @@ class PositionalEncoding(nn.Module):
 
 class LayerNormalization(nn.Module):
 
-    def __init__(self, features: int, eps: float) -> None:
+    def __init__(self, features: int, eps: float=10**-6) -> None:
         # features is the size of last dimension of x of forward method below
         super().__init__()
         self.eps = 10**-6
-        self.alpha = nn.Parameter(torch.ones(features))  # alpha is learnable multiplier
-        self.bias = nn.Parameter(torch.zeros(features))  # alpha is learnable bias
+        self.alpha = nn.Parameter(torch.ones(features, device='mps', dtype=torch.float))  # alpha is learnable multiplier
+        self.bias = nn.Parameter(torch.zeros(features, device='mps', dtype=torch.float))  # alpha is learnable bias
 
     def forward(self, x):
         # x: [batch_size, seq_len, hidden_size] or [batch_size, seq_len, features] from __init__ method above
@@ -135,12 +135,13 @@ class MultiHeadAttentionBlock(nn.Module):
 
         assert d_model % h == 0, "d_model must be a multiplier of h"
         self.d_k = d_model // h
+        self.d_model = d_model
 
     def attention(self, query, key, value, mask):
         # attention_mat: [batch_size, h, seq_len, seq_len]
         attention_mat = (query @ key.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
-            attention_mat.fill_mask(mask == 0, 1e-9)
+            attention_mat.masked_fill_(mask == 0, 1e-9)
         attention_mat = attention_mat.softmax(dim=-1)
 
         # the original implementation may have a problem that dropout will randomly zeros out
@@ -182,7 +183,7 @@ class MultiHeadAttentionBlock(nn.Module):
         # C[1, 2] = 0.2000 * 1. + 0.3000 * 0. + 0.5000 * 1. = 0.8000
         return (attention_mat @ value), attention_mat
 
-    def forward(self, x, q, k, v, mask):
+    def forward(self, q, k, v, mask):
         query = self.Wq(q)
         key = self.Wq(k)
         value = self.Wq(v)
@@ -196,15 +197,15 @@ class MultiHeadAttentionBlock(nn.Module):
             1, 2
         )
 
-        output, attention_mat = self.attention(query, key, value, mask)
+        x, attention_mat = self.attention(query, key, value, mask)
         # 1. transpose a tensor does not return a new contiguous block of memory
         # but reshape operation via view requires the tensor being in contiguous block of memory
         # so we need contiguous() here after transpose.
         # 2. use -1 so that size of the 2nd dimension can be automatically infered based on the size of total size of the
         # tensor. Though I think in our case, we can directly use x.shape[0] instead.
-        output = output.transpose(1, 2).contiguous().view(x.shape[0], -1, self.d_model)
+        x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.d_model)
 
-        return self.Wo(output)
+        return self.Wo(x)
 
 
 class EncoderBlock(nn.Module):
@@ -226,7 +227,7 @@ class EncoderBlock(nn.Module):
     def forward(self, x, src_mask):
         # in translational task, produce weighted embedding average from tokens in original language
         x = self.residual_connections[0](
-            x, lambda x: self.self_attention(x, x, x, src_mask)
+            x, lambda x: self.self_attention_block(x, x, x, src_mask)
         )
         x = self.residual_connections[1](x, self.feed_forward_block)
         return x
@@ -328,11 +329,12 @@ class Transformer(nn.Module):
         self.projection_layer = projection_layer
 
     def encode(self, src, src_mask):
-        x = self.src_embeds(src)
+        x = self.src_embeds(src)                
         x = self.src_pos(x)
-        return self.encoder(x, src_mask)
+        x = self.encoder(x, src_mask)
+        return x
 
-    def decode(self, tgt, encoder_output, src_mask, tgt_mask):
+    def decode(self, encoder_output, src_mask, tgt, tgt_mask):        
         x = self.tgt_embeds(tgt)
         x = self.tgt_pos(x)
         return self.decoder(x, encoder_output, src_mask, tgt_mask)
@@ -344,7 +346,8 @@ class Transformer(nn.Module):
 def build_transformer(
     src_vocab_size: int,
     tgt_vocab_size: int,
-    seq_len: int,
+    src_seq_len: int,
+    tgt_seq_len: int,
     d_model: int = 512,
     dropout: float = 0.1,
     N: int = 6,
@@ -356,8 +359,8 @@ def build_transformer(
     tgt_embeds = InputEmbeddings(d_model, tgt_vocab_size)
 
     # add positional embeddings
-    src_pos = PositionalEncoding(d_model, seq_len, dropout)
-    tgt_pos = PositionalEncoding(d_model, seq_len, dropout)
+    src_pos = PositionalEncoding(d_model, src_seq_len, dropout)
+    tgt_pos = PositionalEncoding(d_model, tgt_seq_len, dropout)
 
     # initialize encoder blocks
     encoder_blocks = nn.ModuleList()
@@ -396,7 +399,7 @@ def build_transformer(
 
     # initialize parameter of transformer
     for p in transformer.parameters():
-        if p.dim > 1:
+        if p.dim() > 1:
             nn.init.xavier_uniform_(p)
 
     return transformer

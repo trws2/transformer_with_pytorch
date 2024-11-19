@@ -1,3 +1,5 @@
 ## use python 3.12
 
-torch==2.0.1
+torch>=2.0.1
+torchmetrics
+tensorboard
